@@ -17,7 +17,7 @@ from fastai.vision.all import load_learner, PILImage
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-MODEL_PATH = BASE_DIR / "models" / "maize_classifier.pkl"
+MODEL_PATH = Path(__file__).resolve().parent / "models" / "maize_classifier.pkl"
 
 print(f"🔍 Looking for model at: {MODEL_PATH}")
 print(f"   File exists: {MODEL_PATH.exists()}")

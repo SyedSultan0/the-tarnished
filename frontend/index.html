@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>THE TARNISHED — Telugu Voice Crop Advisory</title>
+  <meta
+    name="description"
+    content="THE TARNISHED helps farmers identify crop problems and receive actionable, Telugu voice advisory."
+  />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <a class="skip-link" href="#analysis-form">Skip to crop analysis</a>
+
+  <header class="site-header">
+    <div class="container">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">🌾</span>
+        <div class="brand-text">
+          <h1 class="brand-name">THE TARNISHED</h1>
+          <p class="brand-subtitle">Telugu Voice Crop Advisory</p>
+        </div>
+      </div>
+      <div class="server-status" id="server-status" data-state="checking" role="status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span class="status-text">Checking service…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero" aria-labelledby="hero-title">
+      <h2 id="hero-title" class="hero-title">Crop advice you can hear, in your language</h2>
+      <p class="hero-text">
+        THE TARNISHED helps farmers identify crop diseases from a photo and delivers
+        practical, crop-stage and weather-aware advisory in Telugu — with a voice
+        recording you can play on your phone.
+      </p>
+    </section>
+
+    <div class="layout">
+      <section class="card" id="analysis-form" aria-labelledby="form-title">
+        <h2 id="form-title" class="card-title">Crop Analysis</h2>
+
+        <form id="analysis-form" novalidate>
+          <div class="field">
+            <label for="crop">Crop</label>
+            <input
+              id="crop"
+              name="crop"
+              type="text"
+              value="Maize"
+              readonly
+              aria-describedby="crop-hint"
+            />
+            <p class="field-hint" id="crop-hint">
+              The current analysis service supports Maize.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="sowing-date">Sowing date</label>
+            <input
+              id="sowing-date"
+              name="sowing_date"
+              type="date"
+              max=""
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="location">Location / district</label>
+            <input
+              id="location"
+              name="location"
+              type="text"
+              list="district-list"
+              placeholder="e.g. Warangal, Nizamabad…"
+              autocomplete="off"
+            />
+            <datalist id="district-list"></datalist>
+            <p class="field-hint">Select a Telangana district, or type one directly.</p>
+          </div>
+
+          <div class="field">
+            <span class="label" id="image-label">Crop photo</span>
+
+            <div
+              class="drop-zone"
+              id="drop-zone"
+              role="button"
+              tabindex="0"
+              aria-labelledby="image-label"
+              aria-controls="image-input"
+            >
+              <input
+                type="file"
+                id="image-input"
+                name="image"
+                accept="image/*"
+                hidden
+              />
+              <div class="dz-empty" id="dz-empty">
+                <span class="dz-icon" aria-hidden="true">📷</span>
+                <p class="dz-title">Click to upload a photo</p>
+                <p class="dz-sub">or drag &amp; drop an image here</p>
+                <p class="dz-meta">JPG, PNG, WEBP · up to 5 MB</p>
+              </div>
+              <div class="dz-preview" id="dz-preview" hidden>
+                <img id="preview-img" alt="Crop photo preview" />
+              </div>
+              <button type="button" class="dz-remove" id="dz-remove" hidden>
+                Remove image
+              </button>
+            </div>
+            <p class="field-error" id="image-error" hidden></p>
+          </div>
+          <div class="actions">
+            <button type="submit" class="button button-primary" id="analyze-btn">
+              Analyze Crop
+            </button>
+          </div>
+          <p class="whatsapp-cta" id="whatsapp-cta">
+            Prefer WhatsApp?
+            <a id="whatsapp-link" href="https://wa.me/14155238886" target="_blank" rel="noopener">Continue on WhatsApp →</a>
+          </p>
+        </form>
+
+        <div class="loading" id="loading" hidden aria-live="polite">
+          <div class="spinner" aria-hidden="true"></div>
+          <p class="loading-title">Analyzing your crop…</p>
+          <p class="loading-text">
+            Processing the image and gathering diagnosis, crop stage, weather risk and
+            advisory information. This can take a moment.
+          </p>
+        </div>
+
+        <div class="alert alert-error" id="form-error" hidden role="alert"></div>
+      </section>
+      <section class="card results" id="results" aria-labelledby="results-title" hidden>
+        <h2 id="results-title" class="card-title">Analysis Result</h2>
+
+        <div class="result-block">
+          <h3>Diagnosis</h3>
+          <div class="diagnosis" id="result-diagnosis"></div>
+        </div>
+
+        <div class="result-block">
+          <h3>Crop Information</h3>
+          <dl class="detail-list" id="result-crop"></dl>
+        </div>
+
+        <div class="result-block">
+          <h3>Weather</h3>
+          <div class="weather" id="result-weather"></div>
+        </div>
+
+        <div class="result-block recommended" id="result-recommended-block">
+          <h3>Recommended Action</h3>
+          <div id="result-recommended"></div>
+        </div>
+
+        <div class="result-block">
+          <h3>Telugu Advisory</h3>
+          <div class="telugu-advisory" id="result-telugu"></div>
+        </div>
+
+        <div class="result-block voice-block" id="voice-block" hidden>
+          <h3>Voice</h3>
+          <button type="button" class="button button-voice" id="voice-play">
+            <span aria-hidden="true">🔊</span>
+            <span id="voice-label">Play Telugu Advisory</span>
+          </button>
+          <audio id="voice-audio" preload="none" hidden></audio>
+          <p class="field-hint" id="voice-hint"></p>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <p>THE TARNISHED — Telugu Voice Crop Advisory</p>
+      <p class="footer-note">
+        Advice is generated from the crop photo, crop stage and live weather for your
+        location. Always confirm with a local agricultural officer before applying treatment.
+      </p>
+    </div>
+  </footer>
+
+  <script>window.TARNISHED_WHATSAPP_URL = "https://wa.me/14155238886";</script>
+  <script src="js/api.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

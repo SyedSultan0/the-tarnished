@@ -1,20 +1,17 @@
 from gtts import gTTS
 from pathlib import Path
+from uuid import uuid4
 
 
-AUDIO_DIR = Path("audio")
+BASE_DIR = Path(__file__).resolve().parent.parent
+AUDIO_DIR = BASE_DIR / "audio"
+
 AUDIO_DIR.mkdir(exist_ok=True)
 
 
 def generate_telugu_audio(text: str) -> str:
-    """
-    Convert Telugu text into an MP3 audio file.
-
-    Returns:
-        Path to the generated audio file.
-    """
-
-    output_file = AUDIO_DIR / "telugu_advisory.mp3"
+    filename = f"advisory_{uuid4().hex}.mp3"
+    output_file = AUDIO_DIR / filename
 
     tts = gTTS(
         text=text,
@@ -24,4 +21,4 @@ def generate_telugu_audio(text: str) -> str:
 
     tts.save(str(output_file))
 
-    return str(output_file)
+    return filename

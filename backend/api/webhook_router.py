@@ -1,372 +1,225 @@
-
-"""
-webhook_router.py - WhatsApp Webhook Handler for THE TARNISHED
-Complete fixed version with proper image handling and deterministic model inference
-"""
-
-import re
-import traceback
-from typing import Annotated, Optional, Dict, Any
-
-from fastapi import APIRouter, Form, Response, UploadFile
+from fastapi import APIRouter, Request
+from fastapi.responses import Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 
-# Import our modules
+from pathlib import Path
+from datetime import datetime
+import re
+import traceback
+import requests
+
 from core.config import settings
+
 from model import predict_maize
-from weather import get_weather_client, assess_weather_risk
+from weather import (
+    OpenMeteoClient,
+    assess_weather_risk,
+    get_telangana_coordinates
+)
 from crop_stage import get_crop_stage
 from advisory import get_advisory
+from voice import generate_telugu_audio
 
 
-# ------------------------------------------------------------------
-# CREATE ROUTER
-# ------------------------------------------------------------------
+# ============================================================
+# ROUTER
+# ============================================================
 
 router = APIRouter()
 
 
-# ------------------------------------------------------------------
-# SESSION MANAGEMENT
-# ------------------------------------------------------------------
+# ============================================================
+# SESSION STORAGE
+# ============================================================
 
-user_sessions: Dict[str, Dict[str, Any]] = {}
+# Temporary in-memory session storage.
+# Later this can be replaced by Redis / database.
+sessions = {}
 
 
-def get_user_session(user_id: str) -> Dict[str, Any]:
-    """Get or create a user session."""
-
-    if user_id not in user_sessions:
-
-        user_sessions[user_id] = {
+def get_session(phone_number: str) -> dict:
+    if phone_number not in sessions:
+        sessions[phone_number] = {
             "crop": "maize",
             "sowing_date": None,
-            "location": None,
-            "lat": None,
-            "lon": None,
-            "stage": "vegetative",
-            "lang": "te",
-            "last_message": None,
-            "conversation_state": "idle"
+            "district": None,
+            "latitude": None,
+            "longitude": None,
+            # Tracks whether the beginner-friendly welcome/instruction
+            # message has already been sent in this session store.
+            # In-memory only; resets on backend restart (same as the
+            # rest of the session state).
+            "welcomed": False,
         }
 
-    return user_sessions[user_id]
+    return sessions[phone_number]
 
 
-def update_user_session(
-    user_id: str,
-    data: Dict[str, Any]
-):
-    """Update user session data."""
+# ============================================================
+# WHATSAPP WELCOME MESSAGE
+# ============================================================
 
-    session = get_user_session(user_id)
+# Short, beginner-friendly instruction sent once when a new WhatsApp
+# user first interacts with the bot. Sowing date / location are framed
+# as optional because the pipeline still works without them.
+WELCOME_MESSAGE = (
+    "🌱 Welcome to The Tarnished!\n\n"
+    "📸 Send a clear photo of your maize leaf to check for disease.\n\n"
+    "For a more useful advisory, you can also send:\n"
+    "📅 Your sowing date (e.g. 01/07/2026)\n"
+    "📍 Your district/location\n\n"
+    "I'll identify the disease and tell you what action to take."
+)
 
-    session.update(data)
+# Short texts treated as a greeting / bot-start attempt.
+GREETING_KEYWORDS = frozenset({
+    "hi",
+    "hello",
+    "hey",
+    "namaste",
+    "namastey",
+    "start",
+    "join",
+    "help",
+    "menu",
+    "bot",
+    "hai",
+})
 
-    user_sessions[user_id] = session
+
+def is_greeting(text: str) -> bool:
+    """Return True when the message looks like a greeting/bot-start."""
+    if not text:
+        return False
+    cleaned = re.sub(r"[^a-z ]", "", text.lower()).strip()
+    if not cleaned:
+        return False
+    if cleaned in GREETING_KEYWORDS:
+        return True
+    first_word = cleaned.split()[0] if cleaned.split() else ""
+    return first_word in GREETING_KEYWORDS
 
 
-# ------------------------------------------------------------------
+# ============================================================
 # TWILIO CLIENT
-# ------------------------------------------------------------------
+# ============================================================
 
-_twilio_client = None
-
-
-def get_twilio_client():
-    """Get or create Twilio client."""
-
-    global _twilio_client
-
-    if _twilio_client is None:
-
-        _twilio_client = Client(
-            settings.TWILIO_ACCOUNT_SID,
-            settings.TWILIO_AUTH_TOKEN
-        )
-
-    return _twilio_client
+twilio_client = Client(
+    settings.TWILIO_ACCOUNT_SID,
+    settings.TWILIO_AUTH_TOKEN
+)
 
 
-# ------------------------------------------------------------------
+# ============================================================
 # WEATHER CLIENT
-# ------------------------------------------------------------------
+# ============================================================
 
-_weather_client = None
-
-
-def get_weather_client_instance():
-    """Get or create weather client."""
-
-    global _weather_client
-
-    if _weather_client is None:
-
-        _weather_client = get_weather_client()
-
-    return _weather_client
+weather_client_instance = OpenMeteoClient()
 
 
-# ------------------------------------------------------------------
-# IMAGE HANDLING FUNCTIONS
-# ------------------------------------------------------------------
+# ============================================================
+# HELPERS
+# ============================================================
 
-def download_whatsapp_image(
-    media_url: str
-) -> Optional[bytes]:
+def extract_sowing_date(text: str):
     """
-    Download an image from Twilio WhatsApp media URL.
+    Extract a date from farmer's message.
+
+    Supported:
+    DD/MM/YYYY
+    DD-MM-YYYY
+    DD.MM.YYYY
+    YYYY-MM-DD
+
+    Examples:
+    01/06/2026
+    01-06-2026
+    2026-06-01
     """
 
-    import requests
-
-    try:
-
-        print(
-            f"📥 Downloading image from: "
-            f"{media_url}"
-        )
-
-        response = requests.get(
-            media_url,
-            auth=(
-                settings.TWILIO_ACCOUNT_SID,
-                settings.TWILIO_AUTH_TOKEN
-            ),
-            timeout=settings.WHATSAPP_MEDIA_TIMEOUT
-        )
-
-        response.raise_for_status()
-
-        print(
-            f"   Downloaded: "
-            f"{len(response.content)} bytes"
-        )
-
-        return response.content
-
-    except Exception as e:
-
-        print(
-            f"❌ Error downloading image: {e}"
-        )
-
+    if not text:
         return None
-
-
-def validate_and_prepare_image(
-    image_bytes: bytes
-):
-    """
-    Validate and prepare image for model inference.
-
-    IMPORTANT:
-    Returns a normal PIL Image.
-
-    We intentionally DO NOT create a FastAI PILImage here.
-    model.py performs deterministic preprocessing itself.
-    """
-
-    from PIL import Image
-    import io
-
-    try:
-
-        print(
-            "📸 Validating and preparing image..."
-        )
-
-        # ----------------------------------------------------------
-        # OPEN IMAGE
-        # ----------------------------------------------------------
-
-        pil_image = Image.open(
-            io.BytesIO(image_bytes)
-        )
-
-        print(
-            f"   Original: "
-            f"{pil_image.width}x{pil_image.height}, "
-            f"Mode: {pil_image.mode}"
-        )
-
-        # ----------------------------------------------------------
-        # LOAD IMAGE INTO MEMORY
-        # ----------------------------------------------------------
-
-        pil_image.load()
-
-        # ----------------------------------------------------------
-        # CONVERT TO RGB
-        # ----------------------------------------------------------
-
-        if pil_image.mode != "RGB":
-
-            print(
-                f"   Converting from "
-                f"{pil_image.mode} to RGB"
-            )
-
-            pil_image = pil_image.convert("RGB")
-
-        else:
-
-            # Make an independent copy.
-            # This prevents issues with closed file handles
-            # or lazy PIL image data.
-            pil_image = pil_image.copy()
-
-        # ----------------------------------------------------------
-        # RESIZE IF TOO LARGE
-        # ----------------------------------------------------------
-
-        max_size = 1024
-
-        if (
-            pil_image.width > max_size
-            or pil_image.height > max_size
-        ):
-
-            pil_image.thumbnail(
-                (
-                    max_size,
-                    max_size
-                ),
-                Image.Resampling.LANCZOS
-            )
-
-            print(
-                f"   Resized to: "
-                f"{pil_image.width}x"
-                f"{pil_image.height}"
-            )
-
-        # ----------------------------------------------------------
-        # ENSURE MINIMUM SIZE
-        # ----------------------------------------------------------
-
-        if (
-            pil_image.width < 100
-            or pil_image.height < 100
-        ):
-
-            print(
-                f"❌ Image too small: "
-                f"{pil_image.width}x"
-                f"{pil_image.height}"
-            )
-
-            return None
-
-        print(
-            f"✅ Valid image: "
-            f"{pil_image.width}x"
-            f"{pil_image.height}, "
-            f"Mode: {pil_image.mode}"
-        )
-
-        return pil_image
-
-    except Exception as e:
-
-        print(
-            f"❌ Image validation failed: {e}"
-        )
-
-        traceback.print_exc()
-
-        return None
-
-
-# ------------------------------------------------------------------
-# BILINGUAL RESPONSE
-# ------------------------------------------------------------------
-
-def generate_bilingual_response(
-    en_text: str,
-    te_text: str
-) -> str:
-    """Generate bilingual response for WhatsApp."""
-
-    return (
-        f"{en_text}\n\n"
-        f"{te_text}"
-    )
-
-
-# ------------------------------------------------------------------
-# SOWING DATE EXTRACTION
-# ------------------------------------------------------------------
-
-def extract_sowing_date(
-    text: str
-) -> Optional[str]:
-    """
-    Extract sowing date from user message.
-
-    Supports:
-        DD/MM/YYYY
-        DD-MM-YYYY
-        DD.MM.YYYY
-
-    And:
-        YYYY/MM/DD
-        YYYY-MM-DD
-        YYYY.MM.DD
-    """
 
     patterns = [
-
         r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})",
-
-        r"(\d{4})[/.-](\d{1,2})[/.-](\d{1,2})"
-
+        r"(\d{4})[/.-](\d{1,2})[/.-](\d{1,2})",
     ]
 
     for pattern in patterns:
+        match = re.search(pattern, text)
 
-        match = re.search(
-            pattern,
-            text
-        )
+        if not match:
+            continue
 
-        if match:
+        groups = match.groups()
 
-            groups = match.groups()
-
-            # YYYY/MM/DD
+        try:
+            # YYYY-MM-DD
             if len(groups[0]) == 4:
+                year, month, day = map(int, groups)
 
-                return (
-                    f"{groups[2]}/"
-                    f"{groups[1]}/"
-                    f"{groups[0]}"
-                )
-
-            # DD/MM/YYYY
+            # DD-MM-YYYY
             else:
+                day, month, year = map(int, groups)
 
-                return (
-                    f"{groups[0]}/"
-                    f"{groups[1]}/"
-                    f"{groups[2]}"
-                )
+            date_obj = datetime(
+                year,
+                month,
+                day
+            )
+
+            return date_obj.strftime("%Y-%m-%d")
+
+        except ValueError:
+            return None
 
     return None
 
 
-# ------------------------------------------------------------------
-# LOCATION EXTRACTION
-# ------------------------------------------------------------------
+def extract_crop(text: str):
+    """
+    Extract crop from message.
+    """
 
-def extract_location(
-    text: str
-) -> Optional[str]:
-    """Extract location from user message."""
+    if not text:
+        return None
 
-    telangana_districts = [
+    text_lower = text.lower()
 
+    crops = [
+        "maize",
+        "cotton",
+        "paddy",
+        "chilli"
+    ]
+
+    for crop in crops:
+        if crop in text_lower:
+            return crop
+
+    return None
+
+
+def get_location_from_text(text: str):
+    """
+    Extract Telangana district from farmer message.
+
+    Example:
+    Hyderabad
+    Warangal
+    Karimnagar
+    Nizamabad
+    etc.
+    """
+
+    if not text:
+        return None
+
+    text_lower = text.lower().strip()
+
+    # Use the complete district list from weather.py
+    districts = [
         "hyderabad",
         "warangal",
         "nizamabad",
@@ -388,1192 +241,447 @@ def extract_location(
         "gadwal",
         "nagarkurnool",
         "vikarabad",
-        "yadadri"
+        "yadadri",
     ]
 
-    text_lower = text.lower()
-
-    for district in telangana_districts:
-
+    for district in districts:
         if district in text_lower:
+            coordinates = get_telangana_coordinates(district)
 
-            return district.title()
+            if coordinates:
+                return {
+                    "district": district,
+                    "latitude": coordinates[0],
+                    "longitude": coordinates[1],
+                }
 
     return None
 
 
-# ------------------------------------------------------------------
-# DISTRICT COORDINATES
-# ------------------------------------------------------------------
+def extract_lat_lon(text: str):
+    """
+    Optional direct latitude/longitude support.
 
-def get_district_coordinates(
-    district: str
-) -> tuple:
-    """Get approximate coordinates for Telangana districts."""
+    Example:
+    17.385, 78.4867
+    """
 
-    coords = {
+    if not text:
+        return None
 
-        "hyderabad": (
-            17.3850,
-            78.4867
-        ),
+    pattern = r"(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)"
 
-        "warangal": (
-            18.0000,
-            79.5833
-        ),
+    match = re.search(pattern, text)
 
-        "nizamabad": (
-            18.6713,
-            78.1019
-        ),
+    if not match:
+        return None
 
-        "khammam": (
-            17.2473,
-            80.1514
-        ),
+    try:
+        latitude = float(match.group(1))
+        longitude = float(match.group(2))
 
-        "karimnagar": (
-            18.4392,
-            79.1286
-        ),
+        if (
+            -90 <= latitude <= 90
+            and -180 <= longitude <= 180
+        ):
+            return {
+                "latitude": latitude,
+                "longitude": longitude,
+            }
 
-        "mahabubnagar": (
-            16.7422,
-            77.9856
-        ),
+    except ValueError:
+        pass
 
-        "adilabad": (
-            19.6667,
-            78.5333
-        ),
+    return None
 
-        "nalgonda": (
-            17.0575,
-            79.2672
-        ),
 
-        "sangareddy": (
-            17.6220,
-            78.1006
-        ),
+def download_twilio_image(media_url: str):
+    """
+    Download image sent through WhatsApp/Twilio.
+    """
 
-        "medak": (
-            18.0417,
-            78.2640
-        ),
-
-        "siddipet": (
-            18.1010,
-            78.8470
-        ),
-
-        "jagtial": (
-            18.7954,
-            78.9167
-        ),
-
-        "mancherial": (
-            18.8709,
-            79.4253
-        ),
-
-        "peddapalli": (
-            18.6081,
-            79.3764
-        ),
-
-        "kamareddy": (
-            18.3200,
-            78.3400
-        ),
-
-        "bhongir": (
-            17.5150,
-            78.8900
-        ),
-
-        "suryapet": (
-            17.1406,
-            79.6244
-        ),
-
-        "jangaon": (
-            17.7247,
-            79.1680
-        ),
-
-        "gadwal": (
-            16.2357,
-            77.7959
-        ),
-
-        "nagarkurnool": (
-            16.4820,
-            78.3250
-        ),
-
-        "vikarabad": (
-            17.3380,
-            77.9040
-        ),
-
-        "yadadri": (
-            17.5885,
-            79.0280
+    try:
+        response = requests.get(
+            media_url,
+            auth=(
+                settings.TWILIO_ACCOUNT_SID,
+                settings.TWILIO_AUTH_TOKEN
+            ),
+            timeout=30
         )
-    }
 
-    return coords.get(
-        district.lower(),
-        (
-            17.3850,
-            78.4867
+        response.raise_for_status()
+
+        return response.content
+
+    except Exception as error:
+        print(
+            f"❌ Image download failed: {error}"
         )
+
+        return None
+
+
+def save_image(image_bytes: bytes):
+    """
+    Save downloaded image temporarily.
+    """
+
+    image_dir = (
+        Path(__file__).resolve().parent.parent
+        / "temp_images"
+    )
+
+    image_dir.mkdir(
+        exist_ok=True
+    )
+
+    filename = (
+        f"crop_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        f".jpg"
+    )
+
+    image_path = image_dir / filename
+
+    with open(
+        image_path,
+        "wb"
+    ) as file:
+        file.write(image_bytes)
+
+    return image_path
+
+
+# ============================================================
+# RESPONSE FORMATTING
+# ============================================================
+
+def format_english_response(
+    disease: str,
+    confidence: float,
+    stage_info: dict,
+    weather_risk: dict,
+    advisory: dict
+):
+    """
+    Build farmer-facing English advisory.
+    """
+
+    stage = stage_info.get(
+        "stage_name",
+        "unknown"
+    )
+
+    risk_level = weather_risk.get(
+        "risk_level",
+        "low"
+    )
+
+    safety = advisory.get(
+        "safety_precautions",
+        []
+    )
+
+    safety_text = ""
+
+    for item in safety:
+        safety_text += f"• {item}\n"
+
+    return (
+        "🌾 THE TARNISHED - Crop Advisory\n\n"
+
+        f"🔬 Disease: {disease}\n"
+        f"📊 Confidence: {confidence * 100:.1f}%\n"
+        f"🌱 Crop stage: {stage}\n"
+        f"🌤️ Weather risk: {risk_level}\n\n"
+
+        "📝 RECOMMENDED ACTION:\n"
+        f"• Action: {advisory.get('action', 'Not available')}\n"
+        f"• Product: {advisory.get('product', 'Not applicable')}\n"
+        f"• Dosage: {advisory.get('dosage', 'Not applicable')}\n"
+        f"• Timing: {advisory.get('timing', 'Not specified')}\n"
+        f"• Method: {advisory.get('method', 'Not specified')}\n\n"
+
+        "⚠️ SAFETY:\n"
+        f"{safety_text}\n"
+
+        f"📈 Expected result: "
+        f"{advisory.get('expected_result', 'Not specified')}\n\n"
+
+        f"⏰ Urgency: "
+        f"{advisory.get('urgency', 'Not specified')}"
     )
 
 
-# ------------------------------------------------------------------
-# MAIN WEBHOOK ENDPOINT
-# ------------------------------------------------------------------
-
-@router.post("/webhook")
-async def whatsapp_webhook(
-
-    From: Annotated[
-        str,
-        Form()
-    ],
-
-    Body: Annotated[
-        Optional[str],
-        Form()
-    ] = None,
-
-    NumMedia: Annotated[
-        int,
-        Form()
-    ] = 0,
-
-    MediaUrl0: Annotated[
-        Optional[str],
-        Form()
-    ] = None
-
+def format_telugu_response(
+    disease: str,
+    confidence: float,
+    stage_info: dict,
+    weather_risk: dict,
+    advisory: dict
 ):
     """
-    Main WhatsApp webhook handler.
+    Telugu farmer-facing response.
 
-    Receives messages from Twilio
-    and processes them.
+    This is intentionally kept simple because this text
+    is also sent to the Telugu TTS engine.
     """
+
+    stage = stage_info.get(
+        "stage_name",
+        "తెలియదు"
+    )
+
+    risk_level = weather_risk.get(
+        "risk_level",
+        "low"
+    )
+
+    risk_translation = {
+        "low": "తక్కువ",
+        "medium": "మధ్యస్థం",
+        "high": "అధిక"
+    }
+
+    risk_telugu = risk_translation.get(
+        risk_level,
+        risk_level
+    )
+
+    safety = advisory.get(
+        "safety_precautions",
+        []
+    )
+
+    safety_text = ""
+
+    for item in safety:
+        safety_text += f"• {item}\n"
+
+    # Disease names are kept readable.
+    # Later these can be replaced by proper Telugu names.
+    disease_names = {
+        "Common_Rust": "Common Rust",
+        "Gray_Leaf_Spot": "Gray Leaf Spot",
+        "Northern_Corn_Leaf_Blight":
+            "Northern Corn Leaf Blight",
+        "Healthy": "Healthy Plant",
+    }
+
+    disease_display = disease_names.get(
+        disease,
+        disease
+    )
+
+    return (
+        "🌾 THE TARNISHED - పంట సలహా\n\n"
+
+        f"🔬 వ్యాధి: {disease_display}\n"
+        f"📊 నమ్మక స్థాయి: {confidence * 100:.1f}%\n"
+        f"🌱 పంట దశ: {stage}\n"
+        f"🌤️ వాతావరణ ప్రమాదం: {risk_telugu}\n\n"
+
+        "📝 చేయవలసిన చర్య:\n"
+        f"• చర్య: {advisory.get('action', 'సమాచారం లేదు')}\n"
+        f"• మందు: {advisory.get('product', 'వర్తించదు')}\n"
+        f"• మోతాదు: {advisory.get('dosage', 'వర్తించదు')}\n"
+        f"• సమయం: {advisory.get('timing', 'సూచించలేదు')}\n"
+        f"• విధానం: {advisory.get('method', 'సూచించలేదు')}\n\n"
+
+        "⚠️ జాగ్రత్తలు:\n"
+        f"{safety_text}\n"
+
+        f"📈 ఆశించిన ఫలితం: "
+        f"{advisory.get('expected_result', 'సూచించలేదు')}\n\n"
+
+        f"⏰ అత్యవసరత: "
+        f"{advisory.get('urgency', 'సూచించలేదు')}"
+    )
+
+
+# ============================================================
+# MAIN WHATSAPP WEBHOOK
+# ============================================================
+
+@router.post("/webhook")
+async def whatsapp_webhook(request: Request):
 
     response_twiml = MessagingResponse()
 
-    user_id = From
-
-    print(
-        f"\n{'=' * 50}"
-    )
-
-    print(
-        f"📱 Message from: {user_id}"
-    )
-
-    print(
-        f"📝 Body: {Body}"
-    )
-
-    print(
-        f"📸 NumMedia: {NumMedia}"
-    )
-
-    print(
-        f"{'=' * 50}"
-    )
-
     try:
 
-        session = get_user_session(
-            user_id
+        # ----------------------------------------------------
+        # READ FORM DATA
+        # ----------------------------------------------------
+
+        form = await request.form()
+
+        from_number = form.get(
+            "From",
+            ""
         )
 
-        # ==========================================================
-        # HANDLE IMAGES
-        # ==========================================================
+        body = form.get(
+            "Body",
+            ""
+        )
 
-        if NumMedia > 0 and MediaUrl0:
+        media_url = form.get(
+            "MediaUrl0"
+        )
+
+        media_content_type = form.get(
+            "MediaContentType0"
+        )
+
+        print("\n" + "=" * 60)
+        print("📩 WhatsApp message received")
+        print(f"👤 From: {from_number}")
+        print(f"💬 Message: {body}")
+        print(f"📎 Media: {media_url}")
+        print("=" * 60)
+
+        # ----------------------------------------------------
+        # GET SESSION
+        # ----------------------------------------------------
+
+        session = get_session(
+            from_number
+        )
+
+        # WELCOME UX (new user or greeting)
+        # ----------------------------------------------------
+        # First-ever message from this number, or any later
+        # greeting-like message, gets the short instruction text
+        # prepended to the normal reply. The prediction/advisory
+        # flow below is unchanged.
+        needs_welcome = (
+            not session.get("welcomed", False)
+            or is_greeting(body)
+        )
+        if needs_welcome:
+            session["welcomed"] = True
+
+        def with_welcome(text):
+            if needs_welcome and text:
+                return WELCOME_MESSAGE + "\n\n" + text
+            if needs_welcome:
+                return WELCOME_MESSAGE
+            return text
+
+        # EXTRACT CROP
+        # ----------------------------------------------------
+
+        detected_crop = extract_crop(
+            body
+        )
+
+        if detected_crop:
+            session["crop"] = detected_crop
 
             print(
-                f"📸 Processing image "
-                f"from {user_id}"
+                f"🌾 Crop detected: "
+                f"{detected_crop}"
             )
 
-            # ------------------------------------------------------
-            # DOWNLOAD IMAGE
-            # ------------------------------------------------------
+        crop = session.get(
+            "crop",
+            "maize"
+        )
 
-            image_bytes = (
-                download_whatsapp_image(
-                    MediaUrl0
-                )
+        # ----------------------------------------------------
+        # EXTRACT SOWING DATE
+        # ----------------------------------------------------
+
+        detected_sowing_date = extract_sowing_date(
+            body
+        )
+
+        if detected_sowing_date:
+
+            session["sowing_date"] = (
+                detected_sowing_date
             )
 
-            if image_bytes is None:
-
-                message = (
-                    generate_bilingual_response(
-
-                        "❌ Could not download image. "
-                        "Please try again with a clearer photo.",
-
-                        "❌ ఫోటో డౌన్లోడ్ చేయడంలో "
-                        "విఫలమైంది. దయచేసి మళ్లీ ప్రయత్నించండి."
-                    )
-                )
-
-                response_twiml.message(
-                    message
-                )
-
-                return Response(
-                    content=str(response_twiml),
-                    media_type="application/xml"
-                )
-
-            # ------------------------------------------------------
-            # VALIDATE IMAGE
-            # ------------------------------------------------------
-
-            validated_image = (
-                validate_and_prepare_image(
-                    image_bytes
-                )
+            print(
+                f"📅 Sowing date: "
+                f"{detected_sowing_date}"
             )
 
-            if validated_image is None:
+        # ----------------------------------------------------
+        # EXTRACT LOCATION
+        # ----------------------------------------------------
 
-                message = (
-                    generate_bilingual_response(
+        location = get_location_from_text(
+            body
+        )
 
-                        "❌ Could not process image. "
-                        "Please send a clear photo "
-                        "of the crop leaf.",
+        if location:
 
-                        "❌ ఫోటో ప్రాసెస్ చేయడంలో "
-                        "విఫలమైంది. దయచేసి స్పష్టమైన "
-                        "పంట ఆకు ఫోటో పంపండి."
-                    )
-                )
-
-                response_twiml.message(
-                    message
-                )
-
-                return Response(
-                    content=str(response_twiml),
-                    media_type="application/xml"
-                )
-
-            # ======================================================
-            # RUN DISEASE PREDICTION
-            # ======================================================
-
-            try:
-
-                print(
-                    "🔬 Image prepared, "
-                    "running model prediction..."
-                )
-
-                # IMPORTANT:
-                #
-                # Pass the NORMAL PIL image directly.
-                #
-                # DO NOT use:
-                #
-                # FastAIPIL.create(validated_image)
-                #
-                # The model.py inference function now performs
-                # deterministic preprocessing itself.
-                #
-                # This avoids the FastAI training-time random
-                # augmentation / crop_pad path that was causing
-                # the PIL AssertionError.
-
-                result = predict_maize(
-                    validated_image
-                )
-
-                disease = result["disease"]
-
-                confidence = result["confidence"]
-
-                status = result["status"]
-
-                print(
-                    f"🔬 Prediction: {disease} "
-                    f"(confidence: {confidence:.2f}, "
-                    f"status: {status})"
-                )
-
-                # ==================================================
-                # HANDLE UNCERTAIN PREDICTION
-                # ==================================================
-
-                if status == "uncertain":
-
-                    message = (
-                        generate_bilingual_response(
-
-                            (
-                                "⚠️ I'm not confident "
-                                "about this image "
-                                f"(confidence: "
-                                f"{confidence:.1%}).\n\n"
-
-                                "📸 Please send a clearer "
-                                "photo with:\n"
-
-                                "• Better lighting\n"
-
-                                "• Close-up of the "
-                                "affected leaf\n"
-
-                                "• Single leaf, not "
-                                "multiple leaves\n\n"
-
-                                "If the problem continues, "
-                                "consult a local "
-                                "agricultural officer."
-                            ),
-
-                            (
-                                "⚠️ ఈ ఫోటో గురించి నాకు "
-                                "ఖచ్చితంగా తెలియదు "
-                                f"(నమ్మకం: "
-                                f"{confidence:.1%}).\n\n"
-
-                                "📸 దయచేసి స్పష్టమైన "
-                                "ఫోటో పంపండి:\n"
-
-                                "• మంచి వెలుతురు\n"
-
-                                "• ప్రభావిత ఆకు దగ్గరగా\n"
-
-                                "• ఒకే ఆకు, బహుళ "
-                                "ఆకులు కాదు\n\n"
-
-                                "సమస్య కొనసాగితే, "
-                                "స్థానిక వ్యవసాయ "
-                                "అధికారిని సంప్రదించండి."
-                            )
-                        )
-                    )
-
-                    response_twiml.message(
-                        message
-                    )
-
-                    return Response(
-                        content=str(response_twiml),
-                        media_type="application/xml"
-                    )
-
-                # ==================================================
-                # GET WEATHER DATA
-                # ==================================================
-
-                if (
-                    session.get("lat") is not None
-                    and
-                    session.get("lon") is not None
-                ):
-
-                    lat = session["lat"]
-
-                    lon = session["lon"]
-
-                else:
-
-                    # Default Telangana fallback
-                    lat = 17.3850
-                    lon = 78.4867
-
-                weather_client = (
-                    get_weather_client_instance()
-                )
-
-                (
-                    weather_context,
-                    weather_error
-                ) = (
-                    weather_client.get_weather_context(
-                        lat,
-                        lon
-                    )
-                )
-
-                if weather_context:
-
-                    weather_risk = (
-                        assess_weather_risk(
-                            weather_context
-                        )
-                    )
-
-                    weather_summary = (
-                        weather_client.get_weather_summary(
-                            weather_context
-                        )
-                    )
-
-                else:
-
-                    weather_risk = {
-                        "risk_level": "moderate",
-                        "summary": (
-                            "Weather data unavailable"
-                        )
-                    }
-
-                    weather_summary = (
-                        "Weather data unavailable"
-                    )
-
-                # ==================================================
-                # GET CROP STAGE
-                # ==================================================
-
-                crop = session.get(
-                    "crop",
-                    "maize"
-                )
-
-                sowing_date = session.get(
-                    "sowing_date"
-                )
-
-                if sowing_date:
-
-                    (
-                        stage_info,
-                        stage_error
-                    ) = get_crop_stage(
-                        crop,
-                        sowing_date
-                    )
-
-                    if stage_info:
-
-                        crop_stage = (
-                            stage_info["stage_name"]
-                        )
-
-                    else:
-
-                        crop_stage = (
-                            "vegetative"
-                        )
-
-                        stage_info = {
-                            "susceptibility": "Medium"
-                        }
-
-                else:
-
-                    crop_stage = (
-                        "vegetative"
-                    )
-
-                    stage_info = {
-                        "susceptibility": "Medium"
-                    }
-
-                # ==================================================
-                # GENERATE ADVISORY
-                # ==================================================
-
-                (
-                    advisory,
-                    advisory_error
-                ) = get_advisory(
-
-                    disease=disease,
-
-                    confidence=confidence,
-
-                    crop=crop,
-
-                    crop_stage=crop_stage,
-
-                    weather_risk=weather_risk,
-
-                    stage_info=stage_info
-                )
-
-                if advisory_error:
-
-                    message = (
-                        generate_bilingual_response(
-
-                            (
-                                f"🔬 Disease: "
-                                f"{disease}\n"
-
-                                f"Confidence: "
-                                f"{confidence:.1%}\n\n"
-
-                                "⚠️ Advisory "
-                                "generation failed: "
-
-                                f"{advisory_error}\n\n"
-
-                                "Please consult a local "
-                                "agricultural officer."
-                            ),
-
-                            (
-                                f"🔬 వ్యాధి: "
-                                f"{disease}\n"
-
-                                f"నమ్మకం: "
-                                f"{confidence:.1%}\n\n"
-
-                                "⚠️ సలహా రూపొందించడంలో "
-                                "విఫలమైంది: "
-
-                                f"{advisory_error}\n\n"
-
-                                "దయచేసి స్థానిక "
-                                "వ్యవసాయ అధికారిని "
-                                "సంప్రదించండి."
-                            )
-                        )
-                    )
-
-                    response_twiml.message(
-                        message
-                    )
-
-                    return Response(
-                        content=str(response_twiml),
-                        media_type="application/xml"
-                    )
-
-                # ==================================================
-                # FORMAT ENGLISH RESPONSE
-                # ==================================================
-
-                en_response = (
-                    "🌾 THE TARNISHED - "
-                    "Crop Advisory\n"
-                )
-
-                en_response += (
-                    f"{'=' * 30}\n"
-                )
-
-                en_response += (
-                    f"🔬 Disease: "
-                    f"{advisory['disease']}\n"
-                )
-
-                en_response += (
-                    f"📊 Confidence: "
-                    f"{advisory['disease_confidence']:.1%}\n"
-                )
-
-                en_response += (
-                    f"🌱 Stage: "
-                    f"{advisory['crop_stage']}\n"
-                )
-
-                en_response += (
-                    f"🌤️ Weather: "
-                    f"{advisory['weather_risk_level']} "
-                    f"risk\n\n"
-                )
-
-                en_response += (
-                    "📝 RECOMMENDATION:\n"
-                )
-
-                en_response += (
-                    f"• Action: "
-                    f"{advisory['action']}\n"
-                )
-
-                en_response += (
-                    f"• Product: "
-                    f"{advisory['product']}\n"
-                )
-
-                en_response += (
-                    f"• Dosage: "
-                    f"{advisory['dosage']}\n"
-                )
-
-                en_response += (
-                    f"• Timing: "
-                    f"{advisory['timing']}\n\n"
-                )
-
-                # --------------------------------------------------
-                # SAFETY PRECAUTIONS
-                # --------------------------------------------------
-
-                if advisory[
-                    "safety_precautions"
-                ]:
-
-                    en_response += (
-                        "⚠️ Safety:\n"
-                    )
-
-                    for safety in advisory[
-                        "safety_precautions"
-                    ][:3]:
-
-                        en_response += (
-                            f"• {safety}\n"
-                        )
-
-                    en_response += "\n"
-
-                en_response += (
-                    f"📈 Expected: "
-                    f"{advisory['expected_result']}\n"
-                )
-
-                en_response += (
-                    f"⏰ Urgency: "
-                    f"{advisory['urgency']}"
-                )
-
-                # ==================================================
-                # TELUGU RESPONSE
-                # ==================================================
-
-                te_response = (
-                    "🌾 ది టార్నిష్డ్ - "
-                    "పంట సలహా\n"
-                )
-
-                te_response += (
-                    f"{'=' * 30}\n"
-                )
-
-                te_response += (
-                    f"🔬 వ్యాధి: "
-                    f"{advisory['disease']}\n"
-                )
-
-                te_response += (
-                    f"📊 నమ్మకం: "
-                    f"{advisory['disease_confidence']:.1%}\n"
-                )
-
-                te_response += (
-                    f"🌱 దశ: "
-                    f"{advisory['crop_stage']}\n"
-                )
-
-                te_response += (
-                    f"🌤️ వాతావరణం: "
-                    f"{advisory['weather_risk_level']} "
-                    f"ప్రమాదం\n\n"
-                )
-
-                te_response += (
-                    "📝 సిఫార్సు:\n"
-                )
-
-                te_response += (
-                    f"• చర్య: "
-                    f"{advisory['action']}\n"
-                )
-
-                te_response += (
-                    f"• ఉత్పత్తి: "
-                    f"{advisory['product']}\n"
-                )
-
-                te_response += (
-                    f"• మోతాదు: "
-                    f"{advisory['dosage']}\n"
-                )
-
-                te_response += (
-                    f"• సమయం: "
-                    f"{advisory['timing']}\n\n"
-                )
-
-                # --------------------------------------------------
-                # TELUGU SAFETY
-                # --------------------------------------------------
-
-                if advisory[
-                    "safety_precautions"
-                ]:
-
-                    te_response += (
-                        "⚠️ భద్రత:\n"
-                    )
-
-                    for safety in advisory[
-                        "safety_precautions"
-                    ][:3]:
-
-                        te_response += (
-                            f"• {safety}\n"
-                        )
-
-                    te_response += "\n"
-
-                te_response += (
-                    f"📈 ఆశించిన ఫలితం: "
-                    f"{advisory['expected_result']}\n"
-                )
-
-                te_response += (
-                    f"⏰ అత్యవసరం: "
-                    f"{advisory['urgency']}"
-                )
-
-                # ==================================================
-                # FINAL WHATSAPP RESPONSE
-                # ==================================================
-
-                final_message = (
-                    f"{en_response}\n\n"
-                    f"---\n\n"
-                    f"{te_response}"
-                )
-
-                final_message += (
-                    "\n\n"
-                    "🎧 Voice advisory in Telugu "
-                    "coming soon!"
-                )
-
-                response_twiml.message(
-                    final_message
-                )
-
-                return Response(
-                    content=str(response_twiml),
-                    media_type="application/xml"
-                )
-
-            # ======================================================
-            # IMAGE PREDICTION ERROR
-            # ======================================================
-
-            except Exception as e:
-
-                print(
-                    f"❌ Prediction error: {e}"
-                )
-
-                traceback.print_exc()
-
-                message = (
-                    generate_bilingual_response(
-
-                        (
-                            "❌ Error processing image: "
-                            f"{str(e)[:100]}\n\n"
-                            "Please try again with "
-                            "a clearer photo."
-                        ),
-
-                        (
-                            "❌ ఫోటో ప్రాసెస్ చేయడంలో "
-                            "లోపం\n\n"
-                            "దయచేసి మళ్లీ ప్రయత్నించండి."
-                        )
-                    )
-                )
-
-                response_twiml.message(
-                    message
-                )
-
-                return Response(
-                    content=str(response_twiml),
-                    media_type="application/xml"
-                )
-
-        # ==========================================================
-        # HANDLE TEXT COMMANDS
-        # ==========================================================
-
-        if Body:
-
-            body_lower = (
-                Body.lower().strip()
+            session["district"] = (
+                location["district"]
             )
 
-            # ------------------------------------------------------
-            # JOIN
-            # ------------------------------------------------------
-
-            if "join" in body_lower:
-
-                message = (
-                    generate_bilingual_response(
-
-                        (
-                            "✅ Connected to "
-                            "THE TARNISHED "
-                            "Crop Advisory!\n\n"
-
-                            "📸 Send a photo of "
-                            "your crop leaf\n"
-
-                            "📍 Tell me your district "
-                            "(e.g., Hyderabad)\n"
-
-                            "📅 Tell me your sowing date "
-                            "(e.g., 15/06/2026)\n\n"
-
-                            "🌾 Supported crops: "
-                            "Maize (first), Cotton, "
-                            "Paddy, Chilli\n\n"
-
-                            "💡 Tip: Send 'Help' "
-                            "for more info"
-                        ),
-
-                        (
-                            "✅ ది టార్నిష్డ్ పంట "
-                            "సలహా వ్యవస్థకు "
-                            "కనెక్ట్ అయ్యారు!\n\n"
-
-                            "📸 మీ పంట ఆకు ఫోటోను "
-                            "పంపండి\n"
-
-                            "📍 మీ జిల్లా చెప్పండి "
-                            "(ఉదా: హైదరాబాద్)\n"
-
-                            "📅 మీ విత్తన తేదీ చెప్పండి "
-                            "(ఉదా: 15/06/2026)\n\n"
-
-                            "🌾 మద్దతు ఉన్న పంటలు: "
-                            "మొక్కజొన్న (మొదట), "
-                            "పత్తి, వరి, మిరప"
-                        )
-                    )
-                )
-
-                response_twiml.message(
-                    message
-                )
-
-                return Response(
-                    content=str(response_twiml),
-                    media_type="application/xml"
-                )
-
-            # ------------------------------------------------------
-            # HELP / GREETING
-            # ------------------------------------------------------
-
-            if body_lower in [
-                "help",
-                "hi",
-                "hello",
-                "నమస్కారం",
-                "హాయ్"
-            ]:
-
-                message = (
-                    generate_bilingual_response(
-
-                        (
-                            "🌾 THE TARNISHED - Help\n\n"
-
-                            "📸 Send a photo of your "
-                            "crop leaf for disease "
-                            "diagnosis\n"
-
-                            "📍 Send your district "
-                            "name for weather data "
-                            "(e.g., Hyderabad)\n"
-
-                            "📅 Send your sowing date "
-                            "(e.g., 15/06/2026)\n\n"
-
-                            "Supported crops: "
-                            "Maize, Cotton, Paddy, Chilli\n\n"
-
-                            "Example:\n"
-
-                            "1. 'Hyderabad' - "
-                            "sets location\n"
-
-                            "2. '15/06/2026' - "
-                            "sets sowing date\n"
-
-                            "3. Send photo - "
-                            "gets diagnosis"
-                        ),
-
-                        (
-                            "🌾 ది టార్నిష్డ్ - సహాయం\n\n"
-
-                            "📸 వ్యాధి నిర్ధారణ కోసం "
-                            "మీ పంట ఆకు ఫోటోను పంపండి\n"
-
-                            "📍 వాతావరణ డేటా కోసం "
-                            "మీ జిల్లా పంపండి "
-                            "(ఉదా: హైదరాబాద్)\n"
-
-                            "📅 మీ విత్తన తేదీ పంపండి "
-                            "(ఉదా: 15/06/2026)\n\n"
-
-                            "మద్దతు ఉన్న పంటలు: "
-                            "మొక్కజొన్న, పత్తి, వరి, మిరప"
-                        )
-                    )
-                )
-
-                response_twiml.message(
-                    message
-                )
-
-                return Response(
-                    content=str(response_twiml),
-                    media_type="application/xml"
-                )
-
-            # ------------------------------------------------------
-            # SOWING DATE
-            # ------------------------------------------------------
-
-            sowing_date = (
-                extract_sowing_date(
-                    Body
-                )
+            session["latitude"] = (
+                location["latitude"]
             )
 
-            if sowing_date:
-
-                update_user_session(
-                    user_id,
-                    {
-                        "sowing_date":
-                            sowing_date
-                    }
-                )
-
-                message = (
-                    generate_bilingual_response(
-
-                        (
-                            "✅ Sowing date recorded: "
-                            f"{sowing_date}\n\n"
-
-                            "📸 Now send a photo "
-                            "of your crop leaf "
-                            "for diagnosis.\n"
-
-                            "📍 Or tell me your "
-                            "district for weather data."
-                        ),
-
-                        (
-                            "✅ విత్తన తేదీ నమోదు "
-                            "చేయబడింది: "
-                            f"{sowing_date}\n\n"
-
-                            "📸 ఇప్పుడు మీ పంట "
-                            "ఆకు ఫోటోను పంపండి.\n"
-
-                            "📍 లేదా వాతావరణ డేటా "
-                            "కోసం మీ జిల్లా చెప్పండి."
-                        )
-                    )
-                )
-
-                response_twiml.message(
-                    message
-                )
-
-                return Response(
-                    content=str(response_twiml),
-                    media_type="application/xml"
-                )
-
-            # ------------------------------------------------------
-            # LOCATION
-            # ------------------------------------------------------
-
-            location = (
-                extract_location(
-                    Body
-                )
+            session["longitude"] = (
+                location["longitude"]
             )
 
-            if location:
-
-                lat, lon = (
-                    get_district_coordinates(
-                        location
-                    )
-                )
-
-                update_user_session(
-
-                    user_id,
-
-                    {
-                        "location": location,
-                        "lat": lat,
-                        "lon": lon
-                    }
-                )
-
-                message = (
-                    generate_bilingual_response(
-
-                        (
-                            "✅ Location set to: "
-                            f"{location}\n\n"
-
-                            "📸 Now send a photo "
-                            "of your crop leaf "
-                            "for diagnosis.\n"
-
-                            "📅 Or tell me your "
-                            "sowing date."
-                        ),
-
-                        (
-                            "✅ ప్రాంతం నమోదు "
-                            "చేయబడింది: "
-                            f"{location}\n\n"
-
-                            "📸 ఇప్పుడు మీ పంట "
-                            "ఆకు ఫోటోను పంపండి.\n"
-
-                            "📅 లేదా మీ విత్తన "
-                            "తేదీ చెప్పండి."
-                        )
-                    )
-                )
-
-                response_twiml.message(
-                    message
-                )
-
-                return Response(
-                    content=str(response_twiml),
-                    media_type="application/xml"
-                )
-
-            # ------------------------------------------------------
-            # CROP COMMAND
-            # ------------------------------------------------------
-
-            crop_match = re.search(
-                r"crop\s*[:=]\s*(\w+)",
-                body_lower
+            print(
+                f"📍 Location: "
+                f"{location['district']} "
+                f"({location['latitude']}, "
+                f"{location['longitude']})"
             )
 
-            if crop_match:
+        # ----------------------------------------------------
+        # DIRECT LAT/LON
+        # ----------------------------------------------------
 
-                crop = (
-                    crop_match.group(1)
-                )
+        lat_lon = extract_lat_lon(
+            body
+        )
 
-                if crop in [
-                    "maize",
-                    "cotton",
-                    "paddy",
-                    "chilli"
-                ]:
+        if lat_lon:
 
-                    update_user_session(
-                        user_id,
-                        {
-                            "crop": crop
-                        }
-                    )
+            session["latitude"] = (
+                lat_lon["latitude"]
+            )
 
-                    message = (
-                        generate_bilingual_response(
+            session["longitude"] = (
+                lat_lon["longitude"]
+            )
 
-                            (
-                                f"✅ Crop set to: "
-                                f"{crop}\n\n"
+            print(
+                f"📍 Coordinates: "
+                f"{lat_lon['latitude']}, "
+                f"{lat_lon['longitude']}"
+            )
 
-                                f"📸 Now send a photo "
-                                f"of your {crop} leaf."
-                            ),
+        # ----------------------------------------------------
+        # NO IMAGE
+        # ----------------------------------------------------
 
-                            (
-                                f"✅ పంట నమోదు "
-                                f"చేయబడింది: {crop}\n\n"
-
-                                f"📸 ఇప్పుడు మీ {crop} "
-                                f"ఆకు ఫోటోను పంపండి."
-                            )
-                        )
-                    )
-
-                    response_twiml.message(
-                        message
-                    )
-
-                    return Response(
-                        content=str(response_twiml),
-                        media_type="application/xml"
-                    )
-
-            # ------------------------------------------------------
-            # UNKNOWN COMMAND
-            # ------------------------------------------------------
+        if not media_url:
 
             message = (
-                generate_bilingual_response(
+                "🌾 THE TARNISHED\n\n"
+                "Please send a clear photo of your "
+                "maize leaf along with your sowing "
+                "date and district.\n\n"
 
-                    (
-                        "🌾 I didn't understand that.\n\n"
-
-                        "📸 Send a photo of your "
-                        "crop leaf for diagnosis\n"
-
-                        "📍 Send your district name "
-                        "(e.g., Hyderabad)\n"
-
-                        "📅 Send your sowing date "
-                        "(e.g., 15/06/2026)\n\n"
-
-                        "💡 Send 'Help' for more info"
-                    ),
-
-                    (
-                        "🌾 నేను అర్థం చేసుకోలేదు.\n\n"
-
-                        "📸 వ్యాధి నిర్ధారణ కోసం "
-                        "పంట ఆకు ఫోటోను పంపండి\n"
-
-                        "📍 మీ జిల్లా పేరు పంపండి "
-                        "(ఉదా: హైదరాబాద్)\n"
-
-                        "📅 మీ విత్తన తేదీ పంపండి "
-                        "(ఉదా: 15/06/2026)\n\n"
-
-                        "💡 'Help' పంపండి "
-                        "మరింత సమాచారం కోసం"
-                    )
-                )
+                "Example:\n"
+                "Crop: maize\n"
+                "Sowing date: 01/06/2026\n"
+                "District: Hyderabad"
             )
 
             response_twiml.message(
-                message
+                with_welcome(message)
             )
 
             return Response(
@@ -1581,85 +689,409 @@ async def whatsapp_webhook(
                 media_type="application/xml"
             )
 
-        # ==========================================================
-        # DEFAULT WELCOME MESSAGE
-        # ==========================================================
+        # ----------------------------------------------------
+        # IMAGE RECEIVED
+        # ----------------------------------------------------
 
-        message = (
-            generate_bilingual_response(
+        print("📸 Image received")
 
-                (
-                    "🌾 Welcome to "
-                    "THE TARNISHED!\n\n"
+        image_bytes = download_twilio_image(
+            media_url
+        )
 
-                    "📸 Send a photo of "
-                    "your crop leaf\n"
+        if not image_bytes:
 
-                    "📍 Send your district name\n"
-
-                    "📅 Send your sowing date\n\n"
-
-                    "💡 Send 'Help' for more info"
-                ),
-
-                (
-                    "🌾 ది టార్నిష్డ్ కి "
-                    "స్వాగతం!\n\n"
-
-                    "📸 మీ పంట ఆకు "
-                    "ఫోటోను పంపండి\n"
-
-                    "📍 మీ జిల్లా పేరు "
-                    "పంపండి\n"
-
-                    "📅 మీ విత్తన తేదీ "
-                    "పంపండి\n\n"
-
-                    "💡 'Help' పంపండి "
-                    "మరింత సమాచారం కోసం"
+            response_twiml.message(
+                with_welcome(
+                    "❌ I could not download the image. "
+                    "Please send the photo again."
                 )
+            )
+
+            return Response(
+                content=str(response_twiml),
+                media_type="application/xml"
+            )
+
+        print(
+            "✅ Image downloaded"
+        )
+
+        # ----------------------------------------------------
+        # SAVE IMAGE
+        # ----------------------------------------------------
+
+        image_path = save_image(
+            image_bytes
+        )
+
+        print(
+            f"💾 Image saved: "
+            f"{image_path}"
+        )
+
+        # ----------------------------------------------------
+        # DISEASE PREDICTION
+        # ----------------------------------------------------
+
+        prediction = predict_maize(
+            image_path
+        )
+
+        disease = prediction[
+            "disease"
+        ]
+
+        confidence = prediction[
+            "confidence"
+        ]
+
+        status = prediction[
+            "status"
+        ]
+
+        print(
+            f"🔬 Disease: {disease}"
+        )
+
+        print(
+            f"📊 Confidence: "
+            f"{confidence:.4f}"
+        )
+
+        print(
+            f"📌 Status: {status}"
+        )
+
+        # ----------------------------------------------------
+        # CONFIDENCE CHECK
+        # ----------------------------------------------------
+
+        if status == "uncertain":
+
+            response_twiml.message(
+                with_welcome(
+                    "⚠️ The image is not clear enough "
+                    "for a reliable diagnosis.\n\n"
+                    "Please send a clearer photo of the "
+                    "affected leaf."
+                )
+            )
+
+            return Response(
+                content=str(response_twiml),
+                media_type="application/xml"
+            )
+
+        # ----------------------------------------------------
+        # LOCATION FALLBACK
+        # ----------------------------------------------------
+
+        latitude = session.get(
+            "latitude"
+        )
+
+        longitude = session.get(
+            "longitude"
+        )
+
+        if latitude is None or longitude is None:
+
+            # Hyderabad fallback
+            # Keeps the demo functional if farmer
+            # hasn't supplied a district yet.
+
+            latitude = 17.3850
+            longitude = 78.4867
+
+            print(
+                "📍 No location supplied. "
+                "Using Hyderabad fallback."
+            )
+
+        else:
+
+            print(
+                f"📍 Location: "
+                f"{latitude}, {longitude}"
+            )
+
+        # ----------------------------------------------------
+        # CROP STAGE
+        # ----------------------------------------------------
+
+        sowing_date = session.get(
+            "sowing_date"
+        )
+
+        stage_info = None
+
+        if sowing_date:
+
+            stage_info, stage_error = (
+                get_crop_stage(
+                    crop,
+                    sowing_date
+                )
+            )
+
+            if stage_info:
+
+                print(
+                    f"🌱 Crop stage: "
+                    f"{stage_info['stage_name']}"
+                )
+
+                print(
+                    f"📅 Days since sowing: "
+                    f"{stage_info['days_since_sowing']}"
+                )
+
+            else:
+
+                print(
+                    f"⚠️ Crop stage error: "
+                    f"{stage_error}"
+                )
+
+        else:
+
+            print(
+                "⚠️ No sowing date provided"
+            )
+
+        # ----------------------------------------------------
+        # FALLBACK STAGE
+        # ----------------------------------------------------
+
+        if not stage_info:
+
+            stage_info = {
+                "stage_name": "unknown",
+                "stage_description": (
+                    "Crop stage unavailable"
+                ),
+                "days_since_sowing": 0,
+                "susceptibility": "Unknown",
+                "is_critical": False,
+                "progress_percentage": 0,
+                "days_until_harvest": 0,
+            }
+
+        crop_stage = stage_info.get(
+            "stage_name",
+            "unknown"
+        )
+
+        # ----------------------------------------------------
+        # WEATHER
+        # ----------------------------------------------------
+
+        weather_context = None
+
+        weather_context, weather_error = (
+            weather_client_instance
+            .get_weather_context(
+                latitude,
+                longitude
             )
         )
 
-        response_twiml.message(
-            message
+        if weather_context:
+
+            weather_risk = assess_weather_risk(
+                weather_context
+            )
+
+            weather_summary = (
+                weather_client_instance
+                .get_weather_summary(
+                    weather_context
+                )
+            )
+
+            weather_risk["summary"] = (
+                weather_summary
+            )
+
+            print(
+                f"🌤️ Weather risk: "
+                f"{weather_risk['risk_level']}"
+            )
+
+        else:
+
+            print(
+                f"⚠️ Weather error: "
+                f"{weather_error}"
+            )
+
+            weather_risk = {
+                "risk_level": "low",
+                "risk_score": 0,
+                "risk_factors": [],
+                "summary": (
+                    "Weather data unavailable"
+                )
+            }
+
+        # ----------------------------------------------------
+        # ADVISORY ENGINE
+        # ----------------------------------------------------
+
+        advisory, advisory_error = get_advisory(
+            disease=disease,
+            confidence=confidence,
+            crop=crop,
+            crop_stage=crop_stage,
+            weather_risk=weather_risk,
+            stage_info=stage_info
         )
+
+        if advisory is None:
+
+            print(
+                f"⚠️ Advisory unavailable: "
+                f"{advisory_error}"
+            )
+
+            response_twiml.message(
+                with_welcome(
+                    "⚠️ Disease identified, but an "
+                    "advisory is not available for "
+                    "this disease yet.\n\n"
+                    f"Disease: {disease}\n"
+                    f"Confidence: "
+                    f"{confidence * 100:.1f}%"
+                )
+            )
+
+            return Response(
+                content=str(response_twiml),
+                media_type="application/xml"
+            )
+
+        print(
+            "✅ Advisory generated"
+        )
+
+        # ----------------------------------------------------
+        # ENGLISH RESPONSE
+        # ----------------------------------------------------
+
+        en_response = format_english_response(
+            disease=disease,
+            confidence=confidence,
+            stage_info=stage_info,
+            weather_risk=weather_risk,
+            advisory=advisory
+        )
+
+        # ----------------------------------------------------
+        # TELUGU RESPONSE
+        # ----------------------------------------------------
+
+        te_response = format_telugu_response(
+            disease=disease,
+            confidence=confidence,
+            stage_info=stage_info,
+            weather_risk=weather_risk,
+            advisory=advisory
+        )
+
+        # ----------------------------------------------------
+        # SEND TEXT RESPONSE
+        # ----------------------------------------------------
+
+        final_message = (
+            f"{en_response}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"{te_response}"
+        )
+
+        response_twiml.message(
+            with_welcome(final_message)
+        )
+
+        # ----------------------------------------------------
+        # TELUGU TTS
+        # ----------------------------------------------------
+
+        try:
+
+            voice_text = te_response
+
+            audio_filename = (
+                generate_telugu_audio(
+                    voice_text
+                )
+            )
+
+            public_base_url = (
+                settings.PUBLIC_BASE_URL
+                .rstrip("/")
+            )
+
+            audio_url = (
+                f"{public_base_url}"
+                f"/audio/"
+                f"{audio_filename}"
+            )
+
+            audio_message = (
+                response_twiml.message()
+            )
+
+            audio_message.media(
+                audio_url
+            )
+
+            print(
+                f"🎧 Telugu audio generated: "
+                f"{audio_filename}"
+            )
+
+            print(
+                f"🔗 Audio URL: "
+                f"{audio_url}"
+            )
+
+        except Exception as voice_error:
+
+            print(
+                f"⚠️ Telugu TTS failed: "
+                f"{voice_error}"
+            )
+
+            traceback.print_exc()
+
+        # ----------------------------------------------------
+        # RETURN TWILIO RESPONSE
+        # ----------------------------------------------------
 
         return Response(
             content=str(response_twiml),
             media_type="application/xml"
         )
 
-    # ==============================================================
-    # WEBHOOK ERROR HANDLER
-    # ==============================================================
-
-    except Exception as e:
+    except Exception as error:
 
         print(
-            f"❌ Webhook error: {e}"
+            "\n❌ WEBHOOK ERROR:"
+        )
+
+        print(
+            str(error)
         )
 
         traceback.print_exc()
 
-        message = (
-            generate_bilingual_response(
-
-                (
-                    f"❌ An error occurred: "
-                    f"{str(e)[:100]}\n\n"
-                    "Please try again later."
-                ),
-
-                (
-                    "❌ లోపం సంభవించింది\n\n"
-                    "దయచేసి తర్వాత మళ్లీ ప్రయత్నించండి."
-                )
-            )
-        )
-
         response_twiml.message(
-            message
+            with_welcome(
+                "⚠️ Something went wrong while "
+                "processing your request. "
+                "Please try again."
+            )
         )
 
         return Response(
@@ -1668,126 +1100,14 @@ async def whatsapp_webhook(
         )
 
 
-# ------------------------------------------------------------------
-# TEST ENDPOINT
-# ------------------------------------------------------------------
+# ============================================================
+# TEST ROUTE
+# ============================================================
 
 @router.get("/test")
 async def test_webhook():
-    """Test endpoint for webhook status."""
 
     return {
-
         "status": "ok",
-
-        "message":
-            "🌾 THE TARNISHED WhatsApp "
-            "webhook is active!",
-
-        "twilio_configured":
-            bool(
-                settings.TWILIO_ACCOUNT_SID
-            ),
-
-        "crops_supported": [
-            "maize",
-            "cotton",
-            "paddy",
-            "chilli"
-        ]
+        "message": "WhatsApp webhook router is working"
     }
-
-
-# ------------------------------------------------------------------
-# TEST IMAGE ENDPOINT
-# ------------------------------------------------------------------
-
-@router.post("/test-image")
-async def test_image_upload(
-    file: UploadFile
-):
-    """
-    Test endpoint for image upload.
-
-    Used for debugging the disease model
-    without going through WhatsApp/Twilio.
-    """
-
-    try:
-
-        # ----------------------------------------------------------
-        # READ UPLOADED FILE
-        # ----------------------------------------------------------
-
-        contents = await file.read()
-
-        if not contents:
-
-            return {
-                "status": "error",
-                "error": "Uploaded file is empty"
-            }
-
-        # ----------------------------------------------------------
-        # VALIDATE IMAGE USING SAME PIPELINE
-        # ----------------------------------------------------------
-
-        image = (
-            validate_and_prepare_image(
-                contents
-            )
-        )
-
-        if image is None:
-
-            return {
-                "status": "error",
-                "error": (
-                    "Could not validate image"
-                )
-            }
-
-        # ----------------------------------------------------------
-        # RUN MODEL
-        # ----------------------------------------------------------
-
-        print(
-            "🔬 Running test-image prediction..."
-        )
-
-        # IMPORTANT:
-        # Pass normal PIL image directly.
-        #
-        # DO NOT use FastAIPIL.create().
-
-        result = predict_maize(
-            image
-        )
-
-        # ----------------------------------------------------------
-        # RETURN RESULT
-        # ----------------------------------------------------------
-
-        return {
-
-            "status": "success",
-
-            "prediction": result
-
-        }
-
-    except Exception as e:
-
-        print(
-            f"❌ Test image error: {e}"
-        )
-
-        traceback.print_exc()
-
-        return {
-
-            "status": "error",
-
-            "error": str(e)
-
-        }

@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
+    PUBLIC_BASE_URL: str
     TWILIO_WHATSAPP_NUMBER: str = "whatsapp:+17372508034"  # ← ADD THIS
     TWILIO_WHATSAPP_SANDBOX_CODE: str = "join twilio-trial"  # ← ADD THIS
     
@@ -41,6 +42,12 @@ class Settings(BaseSettings):
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
     DEBUG: bool = False
+
+    # Comma-separated allowed CORS origins (the web frontend origin).
+    # If empty, a safe localhost development default is used.
+    # Production example:
+    #   CORS_ALLOW_ORIGINS=https://crop-advisory.example.com
+    CORS_ALLOW_ORIGINS: str = ""
     
     # ------------------------------------------------------------------
     # CONFIDENCE THRESHOLDS

@@ -1,22 +1,26 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
 # Python
-.venv/
-venv/
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+
+# Generated audio
+audio/
+backend/audio/
+backend/generated_audio/
 
 # Jupyter
 .ipynb_checkpoints/
 
-# Dataset
-data/
-
-# Trained models
-models/*.pth
-models/*.pkl
-
-# Environment / secrets
-.env
-
-# OS files
+# VS Code / OS
+.vscode/
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log

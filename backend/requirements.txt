@@ -1,6 +1,4 @@
 # THE TARNISHED backend — Python dependencies
-# Note: torch is a large dependency pulled in by fastai.
-# Install with:  pip install -r requirements.txt
 
 fastapi
 uvicorn
@@ -12,9 +10,10 @@ requests
 # WhatsApp / Twilio
 twilio
 
-# ML model
+# ML model — CPU deployment
 fastai
-torch
+torch==2.7.1+cpu
+torchvision==0.22.1+cpu
 pillow
 numpy
 

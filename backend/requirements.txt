@@ -12,7 +12,6 @@ twilio
 
 # ML model — CPU deployment
 --extra-index-url https://download.pytorch.org/whl/cpu
-fastai
 torch==2.11.0+cpu
 torchvision==0.26.0+cpu
 pillow

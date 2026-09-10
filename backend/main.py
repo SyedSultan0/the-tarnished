@@ -14,7 +14,7 @@ from api import webhook_router
 from api import predict_router
 from core.config import settings
 
-from model import learn as maize_model
+from model import predict_maize, torch_model as maize_model
 from weather import get_weather_client
 from crop_stage import CropStageCalculator
 from advisory import AdvisoryEngine
@@ -131,7 +131,7 @@ def warmup_models():
 
 
     # ==========================================================
-    # 1. WARM UP FASTAI MAIZE MODEL
+    # 1. WARM UP MAIZE MODEL
     # ==========================================================
 
     try:
@@ -146,21 +146,19 @@ def warmup_models():
 
         if maize_model is not None:
 
+            from PIL import Image as PILImage
+
             dummy_image = np.zeros(
                 (224, 224, 3),
                 dtype=np.uint8
             )
 
-            from fastai.vision.all import PILImage
-
-            dummy_pil = PILImage.create(
+            dummy_pil = PILImage.fromarray(
                 dummy_image
             )
 
-            pred, idx, probs = (
-                maize_model.predict(
-                    dummy_pil
-                )
+            predict_maize(
+                dummy_pil
             )
 
             print(
